@@ -1,0 +1,398 @@
+##################################################
+## Project:         Aude fire estimation (2025)
+## Script purpose:  Produce small area estimates and confidence interverals in burned area
+## Date:            2025-08-21
+## Author:          Alexander Massey (alexander.massey@ign.fr)
+##
+## Notes:            
+##################################################
+
+
+setwd("/Users/alexandermassey/Desktop/Work/IGN/Aude_fire/new/")
+
+
+# Needed libraries
+library(data.table)
+library(dplyr)
+library(terra)
+library(arrow)
+library(sf)
+
+#############
+# LOAD DATA #
+#############
+# canopy_metrics <- terra::rast("predictions_full.tif")
+canopy_metrics <- terra::rast("canopy_metrics_bdf_30m.tif")
+canopy_metrics_boot <- terra::rast("predictions_bootstrap.tif")
+BD_key <- arrow::read_parquet("Corresp_CODE_TFV_RasterStack.parquet")
+plots <- arrow::read_parquet("plots.parquet")
+oob_bootstrap_metrics <- arrow::read_parquet("oob_bootstrap_metrics.parquet")
+ph1_bootstrap_preds <- arrow::read_parquet("ph1_bootstrap_preds.parquet")
+phase1_remote_sensing_above_5m  <- arrow::read_parquet("ph1_ref_preds.parquet") %>% rename(npp = raster_name) 
+oob_bootstrap <- arrow::read_parquet("oob_bootstrap.parquet")
+fire_mask <- sf::st_read("fire_mask.gpkg")
+nfi_auxi <- arrow::read_parquet("nfi_pt_phase1_attributes_auxi_noxy.parquet")
+# nfi_plots_new <- arrow::read_parquet("nfi_pt_phase1_attributes_noxy.parquet")
+# nfi_plots <- fread("nfi_pt_phase1_attributes_noxy.csv") %>%
+nfi_plots <- arrow::read_parquet("nfi_pt_phase1_attributes_noxy.parquet") %>% as.data.table %>%
+  mutate(fire = ifelse(is.na(fire),0,fire),          # Burn area
+         fire_bb = ifelse(is.na(fire_bb),0,fire_bb), # Extended area around burn area to borrow strength
+         v_wac2 = ifelse(is.na(v_wac) & !is.na(poidse2), 0, v_wac),
+         year = as.numeric(paste0("20", substring(npp,1,2))),
+         weight_cat = paste0(year,":",cso,":", niveau,":", nvx_alleges),
+         class_stat = case_when(
+           cso %in% c("1","3") ~ "forest",
+           cso == "4L" ~ "lande",
+           .default = "other"
+         )
+         ) %>%  # Need zero volumes for estimation
+  group_by(class_stat) %>%
+  mutate(weight_aggegated = n()/sum(!is.na(poidse2))) %>%
+  ungroup() %>%
+  merge(nfi_auxi %>% 
+          dplyr::select(npp, gap_area_percent, mean, sd, Perc_10 = perc_10, Perc_20 = perc_20, Perc_30 = perc_30, Perc_99 = perc_99, vh), all.x = TRUE) %>%
+  # filter(fire_bb == 1) %>% # canopy height model only calculated for fire_bb == 1
+  mutate(vh = ifelse(is.na(vh) & !is.na(poidse2), 0, vh),
+         mean = ifelse(is.na(mean), 0, log(mean)),
+         sd = ifelse(is.na(sd), 0, sd),
+         Perc_10 = ifelse(is.na(Perc_10), 0, log(Perc_10)),
+         Perc_20 = ifelse(is.na(Perc_20), 0, log(Perc_20)),
+         Perc_30 = ifelse(is.na(Perc_30), 0, log(Perc_30)),
+         BD = case_when(
+           substring(CODE_TFV,1,2) == "FF" ~ "closed",
+           substring(CODE_TFV,1,2) == "FO" ~ "open",
+           .default = "other"
+         ),
+         BDclosed = if_else(BD == "closed", 1, 0),
+         BDopen   = if_else(BD == "open",   1, 0),
+         BDother  = if_else(BD == "other",  1, 0))
+         
+set.seed(234)
+# when gap_area_percent == 100 these mean and sd are NA
+# We can randomly input them between 0 and threshold (5 meters) for mean
+# and for sd 0 and the minimum sd observed
+nfi_metrics <- fread("nfi_pt_phase1_attributes_metric_noxy.csv") %>%
+  mutate(mean = ifelse(is.na(mean), runif(sum(is.na(mean)), min = 0, max = 5), mean),
+         sd = ifelse(is.na(sd), runif(sum(is.na(sd)), min = 0, max =  min(.$sd, na.rm = TRUE)), sd)) %>%
+  dplyr::select(npp = raster_name, mean, sd, gap_area_percent, v_wac, H0_wac) %>%
+  merge(nfi_plots %>% dplyr::select(npp, fire, fire_bb))
+
+
+bb_surface_area_ha <- 89605.73
+
+
+##  FUNCTIONS
+# need non-uniform iid estimator and variance function
+one_phase_non_uniform <- function(y, w) {
+  
+  # remove NAs consistently
+  keep <- !is.na(y) & !is.na(w)
+  y <- y[keep]
+  w <- w[keep]
+  
+  n2 <- length(y)
+  if (n2 < 2) stop("Need at least 2 non-missing observations")
+  
+  # design-based mean
+  mu_hat <- weighted.mean(y, w = w)
+  
+  # average weight
+  bar_M2 <- mean(w)
+  
+  # variance estimator
+  var_hat <- (1 / n2) * (1 / (n2 - 1)) *
+    sum(((w / bar_M2)^2) * (y - mu_hat)^2)
+  
+  # return as list
+  list(
+    mean = mu_hat,
+    variance = var_hat,
+    se = sqrt(var_hat),
+    n = n2
+  )
+}
+
+
+
+
+
+
+# Attempt to recreate sampling weights
+ztir <- fread("ztir_aude.csv")
+
+
+# check percentage of kNN training set that is truly external (coded as 0)
+print(paste0("External: ", 100*round(table(nfi_metrics$fire_bb)[1]/nrow(nfi_metrics), 2), "%"))
+
+
+# Extract surface area of burned area
+fire_surface_area_ha <- st_area(fire_mask) %>% 
+  units::set_units(ha) %>% 
+  sum %>% 
+  as.numeric
+
+
+# Rasterize fire_mask and intersect with canopy_metrics
+fire_mask_vect <- vect(fire_mask) %>%
+  project(canopy_metrics)  # use same coordinate system
+
+canopy_in_fire <- mask(crop(canopy_metrics, fire_mask_vect), fire_mask_vect)
+canopy_in_fire_boot <- mask(crop(canopy_metrics_boot, fire_mask_vect), fire_mask_vect)
+
+
+
+# convert to data.frame and extra mean of wall-to-wall canopy height model predictions from kNN
+exhaustive_mean <- as.data.frame(canopy_in_fire,
+                                   xy = FALSE,
+                                   na.rm = FALSE) %>%
+  filter(!is.na(gap_area_percent)) %>%
+  mutate(mean = ifelse(is.na(mean), 0, log(mean)),
+         sd = ifelse(is.na(sd), 0, sd),
+         Perc_10 = ifelse(is.na(Perc_10), 0, log(Perc_10)),
+         Perc_20 = ifelse(is.na(Perc_20), 0, log(Perc_20)),
+         Perc_30 = ifelse(is.na(Perc_30), 0, log(Perc_30)),
+         BDclosed = ifelse(CODE_TFV_NUM %in% 2:26, 1,0),
+         BDopen = ifelse(CODE_TFV_NUM %in% 27:30, 1,0),
+         BDother = ifelse(!(CODE_TFV_NUM %in% 2:30) | is.na(CODE_TFV_NUM), 1,0),
+         mean_in_closed_forest_BD = mean*BDclosed,
+         sd_in_closed_forest_BD = sd*BDclosed,
+         gap_area_percent_in_closed_forest_BD = gap_area_percent*BDclosed,
+         Perc_20_in_closed_forest_BD = Perc_20*BDclosed,
+         Perc_20_in_open_forest_BD = Perc_20*BDopen,
+         ) %>%
+  dplyr::select(Perc_10, Perc_20, Perc_30, gap_area_percent, mean, sd, BDclosed, BDopen, BDother,
+                mean_in_closed_forest_BD, sd_in_closed_forest_BD,gap_area_percent_in_closed_forest_BD,
+                Perc_20_in_closed_forest_BD, Perc_20_in_open_forest_BD) %>%
+  colMeans
+
+exhaustive_df <- as.data.frame(canopy_in_fire,
+              xy = FALSE,
+              na.rm = FALSE) %>%
+  filter(!is.na(gap_area_percent)) %>%
+  mutate(mean = ifelse(is.na(mean), 0, log(mean)),
+         sd = ifelse(is.na(sd), 0, sd),
+         Perc_10 = ifelse(is.na(Perc_10), 0, log(Perc_10)),
+         Perc_20 = ifelse(is.na(Perc_20), 0, log(Perc_20)),
+         Perc_30 = ifelse(is.na(Perc_30), 0, log(Perc_30)),
+         BDclosed = ifelse(CODE_TFV_NUM %in% 2:26, 1,0),
+         BDopen = ifelse(CODE_TFV_NUM %in% 27:30, 1,0),
+         BDother = ifelse(!(CODE_TFV_NUM %in% 2:30) | is.na(CODE_TFV_NUM), 1,0),
+         mean_in_closed_forest_BD = mean*BDclosed,
+         sd_in_closed_forest_BD = sd*BDclosed,
+         gap_area_percent_in_closed_forest_BD = gap_area_percent*BDclosed,
+         Perc_20_in_closed_forest_BD = Perc_20*BDclosed,
+         Perc_20_in_open_forest_BD = Perc_20*BDopen,
+  ) %>%
+  dplyr::select(Perc_10, Perc_20, Perc_30, gap_area_percent, mean, sd, BDclosed, BDopen, BDother,
+                mean_in_closed_forest_BD, sd_in_closed_forest_BD,gap_area_percent_in_closed_forest_BD,
+                Perc_20_in_closed_forest_BD, Perc_20_in_open_forest_BD)
+
+exhaustive_mean
+
+
+
+# Synthetic total estimate from kNN  (this should be 63533)
+exhaustive_mean*fire_surface_area_ha
+
+# Synthetic bootstrap estimates from kNN  (this should be 63533)
+canopy_in_fire_boot_df <- as.data.frame(canopy_in_fire_boot,
+              xy = FALSE,
+              na.rm = TRUE)
+
+boots_knn <- colMeans(canopy_in_fire_boot_df)
+
+quantile(boots_knn, c(0.025,0.975))*fire_surface_area_ha
+
+
+
+# Subset to burn area extended by NFI plots to borrow strength in model-assisted estimator
+burn_area_extended <- nfi_plots %>% 
+  # filter(((fire==0 & !is.na(vh)) | fire == 1)) %>% # take fire_bb
+  filter(fire_bb==1 & ((fire==0 & !is.na(v_wac2)) | fire == 1)) %>% # take fire_bb
+  # filter((fire==0 & !is.na(v_wac2)) | fire == 1) %>% # take all for bigger three phase
+  merge(ztir, by = c("npp", "dep"), all.x = TRUE) %>%
+  mutate(gap_area_percent_in_closed_forest_BD = ifelse(class_3 == "closed", gap_area_percent, 0),
+         mean_in_closed_forest_BD = mean*BDclosed,
+         mean_in_closed_forest_CSO = ifelse(class_2 == "closed", mean, 0),
+         sd_in_closed_forest_BD = sd*BDclosed,
+         sd_in_closed_forest_CSO = ifelse(class_2 == "closed", sd, 0),
+         Perc_20_in_closed_forest_BD = Perc_20*BDclosed,
+         Perc_20_in_open_forest_BD = Perc_20*BDopen,
+         # preds0 = ifelse(is.na(preds), 0, preds),
+         # preds2 = ifelse(is.na(preds), runif(sum(is.na(preds)), min = 0, max = log(min(.$preds, na.rm = TRUE))), log(preds)),
+         # preds3 = ifelse(class_3 %in% c("closed"), preds2, 0),
+         lande_nonforest_bdforet = ifelse(class_3 %in% c("Opened","Missing"),1,0),
+         class_1_simplified = case_when(
+           cso == "1"   ~ "closed",
+           cso == "3"   ~ "Opened",
+           # cso == "4L"  ~ "Lande",
+           TRUE         ~ "Other"
+           ),
+         class_change_to_closed = ifelse(BD != "closed" & class_1_simplified == "closed", 1, 0),
+         class_change_to_forest = ifelse(BD == "Other" & class_1_simplified != "Other", 1, 0),
+         class_change_to_open = ifelse(BD != "Opened" & class_1_simplified == "Opened", 1, 0)
+         ) %>%
+  ungroup
+
+
+
+
+# library(MASS)
+
+
+
+mod_reduced <- lm(vh ~ BDopen + BDclosed + mean_in_closed_forest_BD + gap_area_percent_in_closed_forest_BD + fire, 
+                  data = burn_area_extended %>% filter(class_3=="closed"), weights = weight_aggegated)
+
+mod_reduced <- lm(vh ~ (BDopen + BDclosed + mean_in_closed_forest_BD + gap_area_percent_in_closed_forest_BD + sd_in_closed_forest_BD)^2 + fire, 
+                  data = burn_area_extended, weights = weight_aggegated)
+
+mod_reduced_ext <- lm(v_wac2 ~ gap_area_percent + Perc_20, 
+                  data = burn_area_extended %>% filter(fire == 0))
+
+
+
+mod_full <- lm(v_wac2 ~ BD + cso + mean_in_closed_forest_BD + gap_area_percent_in_closed_forest_BD + sd_in_closed_forest_BD + class_1_simplified + fire, 
+               data = burn_area_extended, weights = poidse2)
+
+
+
+summary(mod_reduced)
+summary(mod_full)
+plot(mod_reduced)
+plot(mod_full)
+
+
+# run stepwise selection (both directions by default)
+mod_step <- MASS::stepAIC(mod_reduced, 
+                    direction = "both", 
+                    scope = list(upper = ~.,
+                                 lower = ~fire),
+                    k = log(375),
+                    trace = F)  # set trace=FALSE to suppress output
+
+summary(mod_step) # stepwise by BIC does not improve on it
+
+mod_reduced <- mod_step
+
+
+library(bcaboot)
+
+
+
+# define the statistic function for bcajack
+stat_fun <- function(mat) {
+  fire <- mat[,"fire"]
+  m_in <- mat[fire==1,]
+  weighted.mean(m_in[,1], w = m_in[,2], na.rm = TRUE) * fire_surface_area_ha
+}
+
+set.seed(123)
+
+# mat_in <- cbind(vol = burn_area_extended$v_wac2[burn_area_extended$fire==1&burn_area_extended$year!=2024], 
+#                 w = burn_area_extended$poidse2[burn_area_extended$fire==1&burn_area_extended$year!=2024])
+
+mat_in <- cbind(vol = burn_area_extended$vh[burn_area_extended$fire==1], 
+                w = burn_area_extended$poidse2[burn_area_extended$fire==1],
+                fire = burn_area_extended$fire[burn_area_extended$fire==1])
+
+# run bcajack for estimator 1
+bca_est1 <- bcajack(
+  x = mat_in,
+  B = 10000,                # number of bootstrap replicates
+  func = stat_fun
+)
+
+
+# bcaplot(bca_est1)
+c(estimate = stat_fun(mat_in),bca_est1$lims[c(1,9),1])
+
+
+
+
+
+# define the statistic function for bcajack
+stat_fun2 <- function(mat) {
+  
+  # get response, weights, and design matrix
+  y <- mat[, "y"]
+  w <- mat[, "w"]
+  
+  # keep all columns except y and w for predictors
+  X <- mat[, setdiff(colnames(mat), c("y","w")), drop = FALSE]
+  fire <- X[,"fire"]
+  X <- X[,c(-1)]
+  
+  # fit weighted least squares
+  mod <- lm(y ~ X, weights = w)  # add intercept
+  
+  names(mod$coefficients) <- gsub("X", "", names(mod$coefficients))
+  coeff_names <- names(mod$coefficients)
+  
+  exhaust_vec <- t(exhaustive_mean) %>% 
+    as.data.frame %>% 
+    mutate(fire = 1) %>%
+    select(all_of(coeff_names[-1]))
+  
+  as.numeric(fire_surface_area_ha*(mod$coefficients %*% c(1,as.numeric(exhaust_vec))))
+}
+
+set.seed(123)
+
+# mod_reduced
+
+# get model matrix
+mod_in <- lm(vh ~ BDopen + BDother + mean_in_closed_forest_BD + gap_area_percent_in_closed_forest_BD + fire, 
+                              data = burn_area_extended, x = T, y = T, weights = poidse2)
+summary(mod_in)$adj.r.squared
+
+matrix_in <- cbind(y = mod_in$y,
+                   w = mod_in$weights,
+                   mod_in$x)
+
+# run bcajack for estimator 1
+bca_est2 <- bcajack(
+  x = matrix_in,
+  B = 10000,                # number of bootstrap replicates
+  func = stat_fun2
+)
+
+
+# bcaplot(bca_est2)
+
+
+
+
+mod_ext <- lm(formula = vh ~ BDopen + BDother + mean_in_closed_forest_BD + gap_area_percent_in_closed_forest_BD, 
+              data = burn_area_extended[burn_area_extended$fire == 0,], weights = poidse2, x = TRUE, y = TRUE)
+summary(mod_ext)
+pred_external <- mean(predict(mod_ext, newdata = exhaustive_df))
+burn_area_extended <- burn_area_extended %>%
+  mutate(residuals_external = vh-predict(mod_ext, newdata = burn_area_extended))
+
+residual_calc <- one_phase_non_uniform( y = burn_area_extended[burn_area_extended$fire==1, "residuals_external"], 
+                               w = burn_area_extended[burn_area_extended$fire==1, "poidse2"])
+
+pred_external + residual_calc$mean
+
+design_based_calc <- one_phase_non_uniform( y = burn_area_extended[burn_area_extended$fire==1, "vh"], 
+                                            w = burn_area_extended[burn_area_extended$fire==1, "poidse2"])
+
+
+# Get table
+results <- rbind(
+  Design_based = c(estimate = fire_surface_area_ha * design_based_calc$mean, 
+                   CI0.025=fire_surface_area_ha * (design_based_calc$mean - 1.96*design_based_calc$se),
+                   CI0.975=fire_surface_area_ha * (design_based_calc$mean + 1.96*design_based_calc$se)),
+  # Design_based_boot = c(estimate = stat_fun(mat_in),bca_est1$lims[c(1,9),1]),
+  External_linear = c(estimate = fire_surface_area_ha * (pred_external + residual_calc$mean),
+                      fire_surface_area_ha * (pred_external + residual_calc$mean - 1.96*sqrt(residual_calc$variance)),
+                      fire_surface_area_ha * (pred_external + residual_calc$mean + 1.96*sqrt(residual_calc$variance))),
+  GREG = c(estimate = fire_surface_area_ha * 10.283906,
+           fire_surface_area_ha * (10.283906 - 1.96*sqrt(3.040884)),
+           fire_surface_area_ha * (10.283906 + 1.96*sqrt(3.040884)))
+  # GREG_boot = c(estimate = stat_fun2(matrix_in),bca_est2$lims[c(1,9),1])
+) %>% round(0) %>% as.data.frame
+
+results$CI_length <- results$CI0.975 - results$CI0.025
+results

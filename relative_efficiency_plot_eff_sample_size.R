@@ -1,0 +1,138 @@
+# ==============================================================================
+# 1. USER CONFIGURATION BLOCK (Adjust your plot parameters here)
+# ==============================================================================
+
+# --- Plot Metadata & Typography ---
+plot_title    <- "Efficiency Gains: Model-Assistance vs. Effective Sample Size"
+plot_subtitle <- "Precision gains through improving the predictive power of the model or \nincreasing the effective sample size"
+x_axis_title  <- "Reduction in Confidence Interval Length (%)"
+left_y_title  <- expression(Model-assisted ~ R^{2})
+right_y_title <- expression(Equivalent ~ n[eff] ~ Increase)
+
+# --- Caption Configuration ---
+# The text body for the markdown caption
+refined_statement <- "Tripling the effective sample size is mathematically equivalent to employing a model-assisted technique with an R² of 0.67. While the latter requires the complex acquisition and processing of high-performing remote sensing auxiliaries that may not be available globally, spatial-temporal smoothing (i.e. \"borrowing strength\" utilizing spatial neighbors and historical data) offers a universal framework to achieve the same precision gains using the data we already possess."
+caption_wrap_width <- 120 # Width boundary for text-wrapping
+
+# --- Milestone Settings (The points plotted on the line) ---
+milestone_r2 <- c(0.33, 0.5, 0.67, 0.8, 0.9)
+
+# --- Axis Breaks & Layout Control ---
+x_tick_count    <- 6   # Total number of evenly spaced ticks on the X-axis
+multiplier_labs <- c(1, 2, 3, 4, 5, 10, Inf) # Non-linear milestones for the grid lines
+left_tick_step  <- 0.1 # Increments for the linear R² left axis (e.g., 0.1 gives 0 to 1.0)
+
+# --- Curve Annotation Positioning ---
+# Arrow start position
+arrow_x_start <- 25   
+arrow_y_start <- 0.82 
+# Arrow end position (where it points on the line)
+arrow_x_end   <- 41   
+arrow_y_end   <- 0.683
+arrow_curve   <- 0.1  # Bending factor of the annotation arrow
+
+# Text tag position
+anno_text_x   <- 25
+anno_text_y   <- 0.88
+anno_text_lab <- "'Borrowing Strength' Equivalence*"
+
+# --- Global Layout Styles ---
+theme_base_size <- 14
+line_color      <- "black"
+milestone_color <- "#e74c3c"
+arrow_color     <- "firebrick"
+
+
+# ==============================================================================
+# 2. AUTOMATED BACK-END COMPILING (Do not edit below this line unless developing)
+# ==============================================================================
+
+library(ggplot2)
+library(ggtext)   
+library(stringr)  
+
+# Build primary underlying coordinate dataset
+r2_seq <- seq(0, 1, length.out = 500)
+reduction_pct <- (1 - sqrt(1 - r2_seq)) * 100
+df <- data.frame(r2 = r2_seq, reduction = reduction_pct)
+
+# Format Dataframe for Milestone points
+milestone_df <- data.frame(
+  r2 = milestone_r2,
+  reduction = (1 - sqrt(1 - milestone_r2)) * 100,
+  multiplier = 1 / (1 - milestone_r2)
+)
+
+# Render labels dynamically as multi-line math expressions
+milestone_labels <- lapply(1:nrow(milestone_df), function(i) {
+  row <- milestone_df[i, ]
+  bquote(atop(n[eff] == .(round(row$multiplier, 1)) %*% n, 
+              (R^2 == .(row$r2))))
+})
+
+# Compile structured caption layout with the red HTML asterisk
+raw_caption <- paste0("<span style='color:red;'>*</span> ", refined_statement)
+formatted_caption <- str_wrap(raw_caption, width = caption_wrap_width)
+
+# Calculate dynamic breaks based on user configuration inputs
+x_breaks <- seq(0, 100, length.out = x_tick_count)
+y_breaks_left <- round(seq(0, 1, by = left_tick_step), 2)
+y_breaks_right <- round(1 - 1 / multiplier_labs, 2)
+right_axis_labels <- c(paste0(multiplier_labs[-length(multiplier_labs)], "x"), Inf)
+
+# Execute Plot Layout Construction
+ggplot(df, aes(x = reduction, y = r2)) +
+  geom_line(color = line_color, size = 1.2) +
+  geom_point(data = milestone_df, aes(x = reduction, y = r2), size = 3, color = milestone_color) +
+  
+  geom_label(data = milestone_df, 
+             aes(x = reduction, y = r2, label = milestone_labels),
+             hjust = -0.1, vjust = 1.1, size = (theme_base_size * 0.255), fontface = "bold", 
+             fill = "white", alpha = 0.8, parse = TRUE) +
+  
+  # Dynamic Arrow Pointer
+  annotate("curve", x = arrow_x_start, y = arrow_y_start, xend = arrow_x_end, yend = arrow_y_end, 
+           curvature = arrow_curve, arrow = arrow(length = unit(2, "mm")), color = arrow_color) +
+  
+  # Dynamic Text Box tag
+  annotate("text", x = anno_text_x, y = anno_text_y, label = anno_text_lab, 
+           fontface = "italic", color = arrow_color, size = (theme_base_size * 0.32)) +
+  
+  scale_x_continuous(limits = c(0, 100), breaks = x_breaks) +
+  scale_y_continuous(
+    limits = c(0, 1), 
+    breaks = y_breaks_right,
+    labels = right_axis_labels,
+    position = "right",
+    sec.axis = sec_axis(
+      transform = ~.,                  
+      breaks = y_breaks_left, 
+      name = left_y_title
+    )
+  ) +
+  labs(
+    title = plot_title,
+    subtitle = plot_subtitle,
+    x = x_axis_title,
+    y = right_y_title,
+    caption = formatted_caption
+  ) +
+  theme_minimal(base_size = theme_base_size) +
+  theme(
+    axis.line.y.left = element_line(color = "black", size = 0.6),
+    axis.line.y.right = element_line(color = "black", size = 0.6), 
+    axis.ticks.y = element_line(color = "black"),           
+    axis.text.y.right = element_text(color = "black"),            
+    
+    panel.grid.major = element_line(color = "gray90"),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(color = "black", size = 0.5),
+    
+    plot.caption = element_textbox_simple(
+      size = (theme_base_size * 0.85), 
+      lineheight = 1.2,
+      padding = margin(t = 15),
+      margin = margin(t = 5)
+    ),
+    plot.title = element_text(face = "bold")
+  )
